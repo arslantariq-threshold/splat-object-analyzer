@@ -18,6 +18,7 @@ import json
 import math
 import os
 import time
+from types import SimpleNamespace
 from collections import defaultdict
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from torchvision.ops import batched_nms
 
 import render_cameras
 from config import PipelineConfig, QUALITY_PRESETS, DEFAULT_QUALITY
+from camera_inputs import add_camera_arguments
 
 OWL_MODEL_REVISION = 'cfd3195ba4ea9592eec887ded089f4c08eff231d'
 
@@ -196,8 +198,21 @@ def _cluster_detections(detections, eps_m=0.5, max_per_label=None,
 # OWLv2 detection
 # ---------------------------------------------------------------------------
 
+def _postprocess_detection_groups(processor, outputs, threshold, target_sizes, independent_label_count=None):
+    """Extra environment classes must not replace the existing object winner."""
+    count = outputs.logits.shape[-1]
+    if not independent_label_count or independent_label_count >= count:
+        return processor.post_process_grounded_object_detection(outputs, threshold=threshold, target_sizes=target_sizes)[0]
+    pieces = []
+    for first, last in ((0, independent_label_count), (independent_label_count, count)):
+        subset = SimpleNamespace(logits=outputs.logits[..., first:last], pred_boxes=outputs.pred_boxes)
+        result = processor.post_process_grounded_object_detection(subset, threshold=threshold, target_sizes=target_sizes)[0]
+        pieces.append({**result, 'labels': result['labels'] + first})
+    return {key: torch.cat([piece[key] for piece in pieces]) for key in ('boxes', 'scores', 'labels')}
+
+
 def _run_owlv2(frames_dir: Path, labels: list[str], transforms: dict, scene_radius: float,
-               score_threshold: float = 0.12):
+               score_threshold: float = 0.12, frame_indices=None, independent_label_count=None):
     """
     Run OWLv2 on all rendered frames.
     Uses per-pixel depth maps (depth_XXXX.npy) for accurate 3D back-projection.
@@ -226,7 +241,9 @@ def _run_owlv2(frames_dir: Path, labels: list[str], transforms: dict, scene_radi
     scene_center  = np.array(transforms.get("scene_center", [0.0, 0.0, 0.0]))
     stored_radius = transforms.get("scene_radius", scene_radius)
 
-    for frame_idx, frame_meta in enumerate(transforms["frames"]):
+    indices = list(range(len(transforms["frames"]))) if frame_indices is None else list(frame_indices)
+    for processed, frame_idx in enumerate(indices):
+        frame_meta = transforms["frames"][frame_idx]
         frame_path = frames_dir.parent / frame_meta["file_path"]
         if not frame_path.exists():
             continue
@@ -253,9 +270,7 @@ def _run_owlv2(frames_dir: Path, labels: list[str], transforms: dict, scene_radi
             outputs = model(**inputs)
 
         target_sizes = torch.tensor([[H, W]], device=device)
-        results = processor.post_process_grounded_object_detection(
-            outputs, threshold=score_threshold, target_sizes=target_sizes,
-        )[0]
+        results = _postprocess_detection_groups(processor, outputs, score_threshold, target_sizes, independent_label_count)
 
         # OWLv2 can emit overlapping proposals for one instance in one image.
         # Suppress these before separate-frame voting creates duplicate objects.
@@ -300,7 +315,7 @@ def _run_owlv2(frames_dir: Path, labels: list[str], transforms: dict, scene_radi
             print(f"  [detect] {label} ({score:.2f}) depth={box_depth:.2f} "
                   f"@ {world_pos.round(3)} {frame_path.name}")
 
-        print(f'[detect] Processed {frame_idx + 1}/{len(transforms["frames"])} views', flush=True)
+        print(f'[detect] Processed {processed + 1}/{len(indices)} views', flush=True)
 
     return raw_detections
 
@@ -334,20 +349,32 @@ def run_pipeline(ply_path: str, prompt: str | None, job_dir: str,
 
     render_seconds = time.perf_counter() - started
     discovery_started = time.perf_counter()
+    environment_report = None
+    if cfg.environment:
+        from environment_understanding import discover_environment
+        environment_report = discover_environment(job_dir, transforms, source_hash, cfg.environment_views)
     if prompt and prompt.strip():
         labels = list(dict.fromkeys(l.strip() for l in prompt.split(',') if l.strip()))
         discovery = {'mode': 'manual', 'labels': labels, 'user_supplied_labels': True}
     else:
         from auto_discover import discover_labels
         labels, discovery = discover_labels(frames_dir, transforms, _select_device())
-    if not labels:
-        raise ValueError('No object labels were discovered. Inspect the rendered views in the output folder.')
     discovery_seconds = time.perf_counter() - discovery_started
     detection_started = time.perf_counter()
 
-    print(f"[pipeline] Step 2: Detecting {labels} in {len(transforms['frames'])} frames …")
-    raw_detections = _run_owlv2(frames_dir, labels, transforms, scene_radius,
-                                score_threshold=cfg.score_threshold)
+    detection_labels = list(labels)
+    if environment_report:
+        from environment_understanding import environment_queries
+        queries, generic = environment_queries(environment_report)
+        environment_labels = sorted(queries, key=lambda q: (q not in generic, -len(queries[q]), q))[:24]
+        detection_labels = list(dict.fromkeys(labels + environment_labels))
+    if not detection_labels:
+        raise ValueError('No scene subjects were discovered. Inspect the rendered views in the output folder.')
+    print(f"[pipeline] Step 2: Detecting {detection_labels} in {len(transforms['frames'])} frames …")
+    all_detections = _run_owlv2(frames_dir, detection_labels, transforms, scene_radius,
+                                score_threshold=cfg.score_threshold, independent_label_count=len(labels))
+
+    raw_detections = [d for d in all_detections if d['label'] in labels]
 
     frame_annotations: dict = {}   # frame_idx (str) → [{label, object_idx, box, score}]
 
@@ -422,12 +449,21 @@ def run_pipeline(ply_path: str, prompt: str | None, job_dir: str,
                        'Objects can be missed, misidentified, duplicated, or merged.'],
         'objects': interactions, 'frame_annotations': frame_annotations,
     }
+    if transforms.get('camera_validation', {}).get('camera_input'):
+        result['input']['camera_input_sha256'] = transforms['camera_validation']['camera_input']['sha256']
     candidates_path = job_dir / 'candidates.json'
     candidates_path.write_text(json.dumps(result, indent=2) + '\n')
     from refine_inventory import refine_inventory
     result = refine_inventory(result, job_dir, _select_device())
     result['timings_seconds']['instance_resolution'] = result['instance_resolution']['seconds']
     result['timings_seconds']['total'] = time.perf_counter() - started
+    if environment_report is not None:
+        from environment_understanding import ground_environment, attach_environment
+        environment_started = time.perf_counter()
+        environment = ground_environment(environment_report, job_dir, transforms, _select_device(), detections=all_detections)
+        result = attach_environment(result, environment, job_dir)
+        result['timings_seconds']['environment_grounding'] = time.perf_counter() - environment_started
+        result['timings_seconds']['total'] = time.perf_counter() - started
     interactions = result['objects']
     temporary = output_path.with_suffix('.json.tmp')
     temporary.write_text(json.dumps(result, indent=2) + '\n')
@@ -446,15 +482,18 @@ if __name__ == "__main__":
     parser.add_argument("--quality",          choices=list(QUALITY_PRESETS.keys()),
                         default=DEFAULT_QUALITY,
                         help="Camera-coverage preset (controls number of views)")
+    parser.add_argument("--no-environment", action="store_true", help="Skip environment discovery and grounding")
     parser.add_argument("--score_threshold",  type=float, default=_d.score_threshold)
     parser.add_argument("--min_votes",        type=int,   default=_d.min_votes)
     parser.add_argument("--min_peak_score",   type=float, default=_d.min_peak_score)
+    add_camera_arguments(parser)
     args = parser.parse_args()
     cfg = PipelineConfig.from_overrides(
         quality=args.quality,
         score_threshold=args.score_threshold,
         min_votes=args.min_votes,
         min_peak_score=args.min_peak_score,
+        camera_input=args.camera_input, camera_limit=args.camera_limit, environment=not args.no_environment,
     )
     result = run_pipeline(args.ply, args.prompt, args.job_dir, cfg)
     print(json.dumps(result, indent=2))

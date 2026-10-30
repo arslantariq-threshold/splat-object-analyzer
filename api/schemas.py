@@ -64,6 +64,9 @@ class OrientedBox(Model):
 
 
 class Evidence(Model):
+    box: list[float] | None = Field(default=None, min_length=4, max_length=4)
+    image_width: int | None = None
+    image_height: int | None = None
     frame_index: int
     image_url: str
     detector_score: float | None = None
@@ -73,6 +76,11 @@ class Evidence(Model):
 
 
 class ObjectRecord(Model):
+    kind: Literal['object', 'structure', 'area'] = 'object'
+    description: str = ''
+    geometry_basis: str | None = None
+    surface_samples: list[Annotated[list[float], Field(min_length=3, max_length=3)]] = Field(default_factory=list, max_length=512)
+    independent_position_count: int | None = None
     id: str
     label: str
     category: str
@@ -234,6 +242,35 @@ class NavigationPath(Model):
     basis: Literal['geometry_candidate_map'] = 'geometry_candidate_map'
 
 
+class CameraSampling(Model):
+    format: Literal['colmap_text', 'colmap_binary', 'camera_json']
+    input_pose_count: int
+    candidate_position_count: int
+    selected_position_count: int
+    selected_image_ids: list[int | str]
+    orientation: Literal['perspective_panorama_source_negative_y_up']
+
+
+class EnvironmentIssue(Model):
+    frame_index: int
+    image_url: str
+    reason: str
+    name: str | None = None
+    kind: Literal['structure', 'area'] | None = None
+
+
+class EnvironmentSummary(Model):
+    version: int
+    fingerprint: str
+    status: Literal['ready', 'partial']
+    entity_ids: list[str]
+    analyzed_view_count: int
+    evidence_frames: list[int]
+    failed_views: list[EnvironmentIssue]
+    ungrounded: list[EnvironmentIssue]
+    limitations: list[str]
+
+
 class AnalysisResult(Model):
     schema_version: Literal['1.0'] = '1.0'
     analysis_id: str
@@ -242,8 +279,10 @@ class AnalysisResult(Model):
     coordinates: CoordinateSystem = Field(default_factory=CoordinateSystem)
     rendered_view_count: int
     understanding_included: bool
+    camera_sampling: CameraSampling | None = None
     navigation: NavigationSummary | None = None
     scene: SceneSummary | None = None
+    environment: EnvironmentSummary | None = None
     objects: list[ObjectRecord]
     groups: list[ObjectGroup] = Field(default_factory=list)
     relations: list[Relation] = Field(default_factory=list)

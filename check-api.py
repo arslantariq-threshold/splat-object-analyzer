@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory() as temporary:
     program = root/'program'; program.mkdir()
     (program/'run_local.py').write_text('''import argparse,hashlib,json,time
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--ply');p.add_argument('--quality');p.add_argument('--job_dir');p.add_argument('--no-navigation',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--ply');p.add_argument('--quality');p.add_argument('--job_dir');p.add_argument('--no-navigation',action='store_true');p.add_argument('--no-environment',action='store_true');p.add_argument('--cameras');p.add_argument('--camera-limit',type=int);a=p.parse_args()
 out=Path(a.job_dir);out.mkdir(exist_ok=True);source=Path(a.ply);content=source.read_bytes()
 with (out/'pipeline-runs.txt').open('a') as log:log.write('run\\n')
 print('[detect] Processed 1/2 views',flush=True)
@@ -46,8 +46,15 @@ obj=dict(id='object_0001',label='desk',confidence=.8,supporting_view_count=2,geo
  oriented_box=dict(type='upright_visible_surface_estimate',position=dict(x=1,y=2,z=3),scale=dict(x=2,y=1,z=1),rotation=dict(x=0,y=.2,z=0,w=.9797958971)),
  bounding_box=dict(type='visible_surface_estimate',min=dict(x=0,y=1.5,z=2.5),max=dict(x=2,y=2.5,z=3.5)),
  frames=[dict(frame_idx=0,score=.8,box=[0,0,10,10])])
-(out/'interactions.json').write_text(json.dumps(dict(input=dict(path=str(source),sha256=digest),objects=[obj],limitations=['Test estimate'])))
-(out/'transforms.json').write_text(json.dumps(dict(frames=[dict(file_path='frames/frame_0000.png')])) )
+source_input=dict(path=str(source),sha256=digest);transforms=dict(frames=[dict(file_path='frames/frame_0000.png')])
+if a.cameras:
+ cameras=json.loads(Path(a.cameras).read_text());fingerprint=hashlib.sha256(json.dumps(cameras,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+ source_input['camera_input_sha256']=fingerprint
+ if content.endswith(b'bad-camera-hash'):source_input['camera_input_sha256']='wrong'
+ chosen=cameras['poses'][:a.camera_limit or 2]
+ transforms['camera_validation']=dict(candidate_count=len(cameras['poses']),selected_positions=len(chosen),camera_input=dict(format=cameras['format'],sha256=fingerprint,input_pose_count=len(cameras['poses']),selected_image_ids=[c['id'] for c in chosen],orientation='perspective_panorama_source_negative_y_up'))
+(out/'interactions.json').write_text(json.dumps(dict(input=source_input,objects=[obj],limitations=['Test estimate'])))
+(out/'transforms.json').write_text(json.dumps(transforms))
 (out/'frames').mkdir(exist_ok=True);(out/'frames/frame_0000.png').write_bytes(b'\\x89PNG\\r\\n\\x1a\\nfixture')
 ''')
     (program/'scene_understanding.py').write_text('''import argparse,json,time
@@ -159,6 +166,49 @@ build_navigation(arrays,a.output,hashlib.sha256(Path(a.splat).read_bytes()).hexd
         assert client.get(fast['result_url'],headers=HEADERS).json()['navigation'] is None
         assert client.get('/v1/analyses/'+fast['id']+'/navigation',headers=AUTH).status_code==404
         assert client.post('/v1/analyses/'+fast['id']+'/queries',json={'prompt':'desk'},headers=AUTH).status_code==409
+        camera_text=b'# Number of images: 2\n1 1 0 0 0 0 0 0 1 front/a.jpg\n\n2 1 0 0 0 1 0 0 1 front/b.jpg\n\n'
+        camera_json=json.dumps(dict(space='source',positions=[[0,0,0],[1,0,0]])).encode()
+        endpoint='/v1/analyses?filename=capture.ply&understanding=false&navigation=false'
+        for camera_part in [('colmap_images',('images.txt',camera_text)), ('cameras',('cameras.json',camera_json))]:
+            capture_response=client.post(endpoint+'&camera_limit=1',files=[('file',('capture.ply',b'ply\nvalid')),camera_part],headers=AUTH)
+            assert capture_response.status_code==202, capture_response.text
+            capture=capture_response.json()
+            assert wait(client,capture['id'])['status']=='succeeded'
+            capture_result=client.get(capture['result_url'],headers=AUTH).json()
+            assert capture_result['camera_sampling']['input_pose_count']==2
+            assert capture_result['camera_sampling']['selected_position_count']==1
+            assert capture_result['source']['sha256']==data['source']['sha256']
+            saved=settings.data_dir/'jobs'/capture['id']
+            assert (saved/'camera_input.json').exists() and not list(saved.glob('camera-upload-*'))
+        plain_form=client.post(endpoint,files={'file':('capture.ply',b'ply\nvalid')},headers=AUTH).json()
+        assert wait(client,plain_form['id'])['status']=='succeeded'
+        assert client.get(plain_form['result_url'],headers=AUTH).json()['camera_sampling'] is None
+        before=set((settings.data_dir/'jobs').iterdir())
+        bad_cases=[ [('file',('capture.ply',b'ply\nvalid')),('cameras',('cameras.json',b'{bad'))],
+                    [('file',('capture.ply',b'ply\nvalid')),('cameras',('cameras.json',camera_json)),('colmap_images',('images.txt',camera_text))],
+                    [('file',('capture.ply',b'ply\nvalid')),('colmap_cameras',('cameras.txt',b'1 PINHOLE 800 600 500 500 400 300'))],
+                    [('file',('capture.ply',b'ply\nvalid')),('file',('again.ply',b'ply\nvalid'))] ]
+        for files in bad_cases:
+            invalid=client.post(endpoint,files=files,headers=AUTH)
+            assert invalid.status_code==400, invalid.text
+        calibration=client.post(endpoint,files=[('file',('capture.ply',b'ply\nvalid')),('colmap_images',('images.txt',camera_text)),
+            ('colmap_cameras',('cameras.txt',b'2 PINHOLE 800 600 500 500 400 300'))],headers=AUTH)
+        assert calibration.status_code==400 and calibration.json()['error']['code']=='invalid_camera_input'
+        encoded=client.build_request('POST',endpoint,files={'file':('capture.ply',b'ply\nvalid')})
+        truncated=client.post(endpoint,content=encoded.read()[:-12],headers={**AUTH,'Content-Type':encoded.headers['Content-Type']})
+        assert truncated.status_code==400
+        settings.max_camera_upload_bytes=16
+        try:
+            camera_too_large=client.post(endpoint,files=[('file',('capture.ply',b'ply\nvalid')),('cameras',('cameras.json',camera_json))],headers=AUTH)
+            assert camera_too_large.status_code==413
+        finally:settings.max_camera_upload_bytes=512*1024**2
+        too_large=client.post(endpoint,files={'file':('capture.ply',b'ply\n'+b'x'*513)},headers=AUTH)
+        assert too_large.status_code==413
+        assert client.post(endpoint+'&camera_limit=1',content=b'ply\nvalid',headers=HEADERS).status_code==400
+        assert client.post(endpoint+'&camera_limit=0',files={'file':('capture.ply',b'ply\nvalid')},headers=AUTH).status_code==422
+        assert set((settings.data_dir/'jobs').iterdir())==before, 'Rejected camera uploads left files behind'
+        mismatch_camera=client.post(endpoint,files=[('file',('capture.ply',b'ply\nbad-camera-hash')),('cameras',('cameras.json',camera_json))],headers=AUTH).json()
+        assert wait(client,mismatch_camera['id'])['status']=='failed', 'Mismatched camera fingerprint was published'
         cors=client.options('/v1/analyses',headers={'Origin':'https://app.example.com','Access-Control-Request-Method':'POST','Access-Control-Request-Headers':'Authorization,Content-Type'})
         assert cors.headers['Access-Control-Allow-Origin']=='https://app.example.com'
         second=Worker(app.state.store,program)
@@ -171,6 +221,12 @@ build_navigation(arrays,a.output,hashlib.sha256(Path(a.splat).read_bytes()).hexd
         assert wait(client,restart['id'])['status']=='succeeded', 'Interrupted job was not resumed'
         assert (settings.data_dir/'jobs'/restart['id']/'analysis/pipeline-runs.txt').read_text().splitlines()==['run'], 'Completed geometry checkpoint was rerun'
         assert client.get(job['result_url'],headers=HEADERS).status_code==200, 'Completed result did not survive restart'
+        capture_restart=client.post('/v1/analyses?filename=capture-restart.ply',files=[('file',('capture-restart.ply',b'ply\ncapture-restart')),('cameras',('cameras.json',camera_json))],headers=AUTH).json()
+        wait(client,capture_restart['id'],lambda j:j['progress']['stage']=='Describing objects from multiple views')
+    with TestClient(create_app(settings,program)) as client:
+        assert wait(client,capture_restart['id'])['status']=='succeeded'
+        assert (settings.data_dir/'jobs'/capture_restart['id']/'analysis/pipeline-runs.txt').read_text().splitlines()==['run'], 'Capture checkpoint was rerun after restart'
+        assert client.get(capture_restart['result_url'],headers=AUTH).json()['camera_sampling']['input_pose_count']==2
 
     limited=Settings(root/'limited', KEY, max_pending_jobs=1, stage_timeout_seconds=1)
     with TestClient(create_app(limited,program)) as client:
@@ -185,4 +241,4 @@ build_navigation(arrays,a.output,hashlib.sha256(Path(a.splat).read_bytes()).hexd
         with TestClient(create_app(Settings(root/'bad-key','short'),program)):pass
     except RuntimeError:pass
     else:raise AssertionError('API started with an unsafe default key')
-print('API authentication, upload limits, queue, results, queries, coordinates, assets, restart recovery, failures, and timeout checks passed.')
+print('API raw/multipart camera uploads, limits, queue, results, queries, coordinates, assets, restart recovery, failures, and timeout checks passed.')

@@ -21,6 +21,7 @@ Fetched dependencies and model weights are not vendored into this source folder:
 | SAM weights | [facebook/sam-vit-base](https://huggingface.co/facebook/sam-vit-base), `d0d9250bd6a38ebbb901aa29e8d37787e366f7be` | Model repository's license and model card |
 | Semantic text matching | [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2), `1110a243fdf4706b3f48f1d95db1a4f5529b4d41` | Model repository’s Apache 2.0 license |
 | Structured JSON generation | [lm-format-enforcer](https://github.com/noamgat/lm-format-enforcer), `0.11.3` | Upstream MIT license |
+| Streaming camera/splat uploads | [python-multipart](https://github.com/Kludex/python-multipart), `0.0.32` | Upstream Apache 2.0 license |
 | Qwen2.5-VL scene-understanding weights | [Qwen/Qwen2.5-VL-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct), `66285546d2b821cf421d4f5eb2576359d3770cd3` | Model repository’s license and model card |
 | OWLv2 weights | [google/owlv2-base-patch16-ensemble](https://huggingface.co/google/owlv2-base-patch16-ensemble), `cfd3195ba4ea9592eec887ded089f4c08eff231d` | Model repository's license and model card |
 | Three.js viewer runtime | [Three.js](https://github.com/mrdoob/three.js), `0.179.0` | Upstream project's license |

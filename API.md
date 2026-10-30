@@ -49,7 +49,7 @@ the same data directory. Separate data directories are not a GPU isolation mecha
 
 ## Upload, poll, fetch
 
-The upload body is the file's raw bytes, **not multipart/form-data**. Supported
+The existing splat-only upload body is the file's raw bytes. Supported
 formats are standard 3DGS PLY and SPZ v1–v3. The default upload limit is 2 GiB.
 `quality=high` is the default; `low` and `medium` are also accepted. Set
 `understanding=false` to omit the slower description/grouping stage and return
@@ -101,6 +101,60 @@ terminal state. Progress counters apply to the current stage, not to an overall
 percentage. A result request before success returns 409. A failed job includes a
 structured error; operator diagnostics are in that job's `worker.log` on disk.
 
+### Optional capture cameras
+
+The same endpoint also accepts `multipart/form-data`. Keep `filename`, `quality`,
+`understanding` and `navigation` in the query string. Send these file parts:
+
+| Part | Contents |
+| --- | --- |
+| `file` | Required PLY or SPZ splat |
+| `colmap_images` | Optional matching COLMAP `images.txt` or `images.bin` |
+| `colmap_cameras` | Optional `cameras.txt`; requires `colmap_images` |
+| `cameras` | Alternative source-space camera JSON; mutually exclusive with COLMAP parts |
+
+```bash
+curl --fail-with-body "$API_URL/v1/analyses?filename=scene.ply&quality=high&camera_limit=8" \
+  -H "Authorization: Bearer $SPLAT_API_KEY" \
+  -F 'file=@/path/to/scene.ply' \
+  -F 'colmap_images=@/path/to/model/images.txt' \
+  -F 'colmap_cameras=@/path/to/model/cameras.txt'
+```
+
+Camera JSON uses the original splat's **source** coordinates, before viewer
+rotation, translation or scale:
+
+```json
+{"space":"source","positions":[[1.2,-0.8,2.1],[2.4,-0.8,1.7]]}
+```
+
+Alternatively use a `poses` array with `id`, `camera_id`, `name`, and `position`
+on each entry. Original photos and `points3D.txt` are not required. COLMAP image
+poses are inverted to obtain their camera centres; `cameras.txt` alone contains
+no capture locations.
+
+Only supplied locations are used when attached. Nearby centres (including
+front/back lens pairs) are reduced through spatial sampling. At most 64 default
+candidate locations receive low-resolution previews; useful surface coverage and
+image quality decide the final subset. `camera_limit` optionally sets the maximum
+selected locations, from 1 to 64; otherwise quality selects 3/5/8 for low/medium/high.
+The existing panoramic sampling then attempts 8/18/24 perspective views per
+selected location; unusable final views are discarded. `camera_sampling` reports
+input, candidate and selected location counts and selected source image IDs.
+Detailed measurements remain in `camera_diagnostics.json`.
+
+The renderer generates fresh perspective orientations using the existing source
+negative-Y up convention, rather than reproducing original fisheye projection or
+capture roll. Cameras and the splat must share a coordinate frame. If no supplied
+locations pass validation, the job fails with diagnostics rather than silently
+switching to generated locations. Omitting cameras keeps automatic placement
+and the raw-byte upload contract. Navigation remains geometry-based.
+
+The combined camera-file limit is 512 MiB, configurable with
+`SPLAT_MAX_CAMERA_UPLOAD_BYTES`; the splat has its own unchanged upload limit.
+
+### Result fields
+
 The result includes:
 
 | Field | Contents |
@@ -109,6 +163,7 @@ The result includes:
 | `source` | Original filename, format, bytes, SHA-256, download URL |
 | `coordinates` | Geometry/camera spaces, units, quaternion order, transform |
 | `rendered_view_count` | Number of accepted rendered analysis views |
+| `camera_sampling` | Optional capture-camera source and sampling counts; null for automatic placement |
 | `understanding_included` | Whether semantic enrichment was requested and completed |
 | `navigation` | Candidate camera-space metadata and grid URL; null when omitted or absent from an older result |
 | `scene` | Inferred space type, description, confidence; null without enrichment |
@@ -253,3 +308,36 @@ uv pip install --python .venv/bin/python -r requirements-api-test.txt
 .venv/bin/python check-navigation.py
 node check-navigation.mjs
 ```
+
+### Environment subjects
+
+With `understanding=true` (the default), analysis also surveys the rendered views
+for structures and areas. The existing `objects` list now includes all grounded
+subjects, identified by `kind: "object" | "structure" | "area"`. Existing object
+IDs and geometry remain unchanged. Environment IDs use `environment_####`.
+
+Environment records include `description`, `attributes`, `geometry_basis`,
+`surface_samples` (at most 512 source-space points), and
+`independent_position_count`. Their `confidence_type` describes mean mask quality,
+not semantic correctness. A subject observed at only one camera location remains
+`uncertain`. Studio keeps those observations available for inspection and excludes
+them from automatic tour targets. The later semantic stage may refine supported
+subject names from masked views or mark unclear descriptions uncertain. Bounds measure visible surfaces, including partially captured façades.
+They do not assert a complete building or free interior volume.
+
+`environment` is null for older/object-only results, or includes the survey
+version/fingerprint, `entity_ids`, analyzed view count, evidence frame IDs,
+`failed_views`, `ungrounded` observations and limitations. Excluded observations
+have no 3D identity and cannot be selected for a camera shot. Issue/image URLs use
+the same authenticated frame endpoint. Evidence records may include a pixel-space
+`box`, `image_width`, and `image_height` for inspection overlays.
+
+`relations` includes observed-surface structural part links and geometric
+structure/area adjacency. `suggested_views` also includes an observed camera for
+each grounded environment entity. Query selection and depth-visibility checks
+include environment surfaces. Navigation constraints remain independent.
+
+The additional fields are additive to schema 1.0; clients that render all subjects
+should display `kind`, distinguish uncertain observations, and avoid interpreting
+area surfaces as permitted camera space. `understanding=false` retains object-only
+processing. The first enabled analysis also requires the pinned local Qwen model.

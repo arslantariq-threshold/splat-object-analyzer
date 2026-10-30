@@ -8,6 +8,7 @@ Keeping every default here prevents the kind of drift that crept in before
 The user-facing knob is `quality` (low/medium/high), which expands to the three
 internal camera counts via `apply_quality()`. The granular counts remain on the
 dataclass for internal use but are not exposed in the UI/API.
+Optional capture inputs can override the selected-location budget via camera_limit.
 """
 
 from dataclasses import dataclass, fields
@@ -33,6 +34,8 @@ class PipelineConfig:
     n_azimuth: int = 6
     n_elevation: int = 3
     fov_x_degrees: float = 90.0
+    camera_input: str | None = None         # optional COLMAP model or source-space JSON
+    camera_limit: int | None = None         # provided-camera locations only; quality default otherwise
 
     # ── automatic camera placement / preview validation ───────────────────
     bbox_pct_lo: float = 1.0                # robust bounding-box lower percentile
@@ -46,6 +49,10 @@ class PipelineConfig:
     # Geometry-only navigation estimate; independent of view-count quality.
     navigation: bool = True
     navigation_resolution: int = 128
+
+    # Environment discovery uses selected RGB views, then mask/depth grounding.
+    environment: bool = True
+    environment_views: int = 12
 
     # ── detection / clustering ─────────────────────────────────────────────
     score_threshold: float = 0.12

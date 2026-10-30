@@ -53,7 +53,8 @@ def proximity(a, b, radius):
 
 
 def bind_groups(objects, prototypes, radius):
-    available = [o for o in objects if o['status'] != 'rejected']
+    available = [o for o in objects if o['status'] != 'rejected'
+                 and (o.get('kind', 'object') == 'object' or o['status'] == 'supported')]
     by_category = defaultdict(list)
     for obj in available:
         by_category[category_key(obj['category'])].append(obj)
@@ -119,9 +120,14 @@ def tour_subjects(objects, categories):
         if category_key(category) in ARCHITECTURE:
             continue
         candidates = [o for o in objects if category_key(o['category']) == category_key(category)
-                      and o['status'] != 'rejected' and not o.get('parent_id')]
+                      and o['status'] != 'rejected' and not o.get('parent_id')
+                      and (o.get('kind', 'object') == 'object' or o['status'] == 'supported')]
         if candidates:
-            heroes.append(max(candidates, key=quality)['id'])
+            structures = [o for o in candidates if o.get('kind') == 'structure']
+            if structures:
+                heroes.extend(o['id'] for o in sorted(structures, key=quality, reverse=True)[:6])
+            else:
+                heroes.append(max(candidates, key=quality)['id'])
     return list(dict.fromkeys(heroes))
 
 

@@ -28,6 +28,7 @@ const download = document.getElementById('download-results');
 let generation = 0;
 let loadedAnnotations = [];
 let showContents = false;
+let showUnconfirmedEnvironment = false;
 let sourceHash = null;
 let lastCamera = null;
 let selectedIds = null;
@@ -36,7 +37,11 @@ const understanding = new SceneUnderstanding({
   onSelection: (ids, index) => {
     selectedIds = ids === null ? null : new Set(ids);
     const descriptions = new Map((index?.objects || []).map(object => [object.id, object]));
-    for (const annotation of loadedAnnotations) annotation.label = descriptions.get(annotation.id)?.display_name || annotation.originalLabel;
+    for (const annotation of loadedAnnotations) {
+      const description = descriptions.get(annotation.id);
+      annotation.resolvedLabel = description?.display_name || annotation.originalLabel;
+      annotation.status = annotation.kind === 'object' ? annotation.originalStatus : description?.status || annotation.originalStatus;
+    }
     displayAnnotations();
   },
   onView: (camera, ids) => {
@@ -50,10 +55,23 @@ const understanding = new SceneUnderstanding({
 
 function displayAnnotations(annotations = loadedAnnotations) {
   loadedAnnotations = annotations;
-  for (const annotation of annotations) annotation.selected = selectedIds !== null && selectedIds.has(annotation.id);
+  for (const annotation of annotations) {
+    annotation.selected = selectedIds !== null && selectedIds.has(annotation.id);
+    const unconfirmed = annotation.kind !== 'object' && annotation.status !== 'supported';
+    annotation.label = annotation.resolvedLabel + (unconfirmed ? ` (${annotation.status})` : '');
+  }
   splatView.clearHighlight();
-  annotationLayer.rebuild(annotations.filter(a => selectedIds !== null ? selectedIds.has(a.id) : (showContents || !a.parentId)));
+  const available = annotations.filter(a => a.kind === 'object' || a.status === 'supported' || showUnconfirmedEnvironment);
+  const availableIds = new Set(available.map(a => a.id));
+  annotationLayer.rebuild(available.filter(a => selectedIds !== null ? selectedIds.has(a.id) :
+    (showContents || !a.parentId || !availableIds.has(a.parentId))));
   if (selectedIds !== null) for (const object of annotationLayer.objects) object.box.show();
+}
+function inventorySummary(result) {
+  const entities = result.environment?.entities || [];
+  const supported = entities.filter(entity => entity.status === 'supported').length;
+  return `${result.objects?.length || 0} objects · ${supported} environment subjects` +
+    (entities.length > supported ? ` · ${entities.length - supported} unconfirmed regions` : '');
 }
 function showStatus(title, detail = '', state = 'running', completed = null, total = null) {
   status.classList.remove('hidden');
@@ -141,17 +159,31 @@ async function loadExample(id) {
   try {
     const result = await loadPair(pair, gen);
     if (gen !== generation || !result) return;
-    showStatus('Analysis ready', `${pair.label || pair.name} · ${result.objects.length} object records`, 'complete');
+    showStatus('Analysis ready', `${pair.label || pair.name} · ${inventorySummary(result)}`, 'complete');
     download.href = pair.annotationsUrl;
     download.classList.remove('hidden');
   }
   catch (error) { hideLoading(); showStatus('Scene could not be loaded', error.message, 'failed'); }
 }
-function uploadScene(file, quality) {
+function uploadScene(file, quality, cameraFiles = []) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     request.open('POST', `/api/jobs?filename=${encodeURIComponent(file.name)}&quality=${quality}`);
-    request.setRequestHeader('Content-Type', 'application/octet-stream');
+    let body = file;
+    if (cameraFiles.length) {
+      body = new FormData();
+      body.append('file', file);
+      const images = cameraFiles.filter(item => /^images\.(txt|bin)$/i.test(item.name));
+      const calibration = cameraFiles.filter(item => /^cameras\.txt$/i.test(item.name));
+      const json = cameraFiles.filter(item => /\.json$/i.test(item.name));
+      if (images.length > 1 || calibration.length > 1 || json.length > 1 ||
+          (images.length && json.length) || (!images.length && !json.length) || (json.length && calibration.length)) {
+        reject(new Error('Choose images.txt or images.bin with optional cameras.txt, or one source-space camera JSON.')); return;
+      }
+      if (images[0]) body.append('colmap_images', images[0]);
+      if (calibration[0]) body.append('colmap_cameras', calibration[0]);
+      if (json[0]) body.append('cameras', json[0]);
+    } else request.setRequestHeader('Content-Type', 'application/octet-stream');
     request.setRequestHeader('X-Splat-Viewer', '1');
     request.upload.onprogress = event => showStatus('Uploading scene', file.name, 'running', event.loaded, event.total);
     request.onerror = () => reject(new Error('The upload failed. Check that the local analyzer is running.'));
@@ -162,7 +194,7 @@ function uploadScene(file, quality) {
       if (request.status !== 202) { reject(new Error(result.error || 'Could not start analysis.')); return; }
       resolve(result.id);
     };
-    request.send(file);
+    request.send(body);
   });
 }
 async function pollJob(id, gen, sceneReady = Promise.resolve()) {
@@ -180,7 +212,7 @@ async function pollJob(id, gen, sceneReady = Promise.resolve()) {
     if (job.status === 'complete') {
       showStatus('Preparing results', job.name);
       await sceneReady;
-      await loadPair(job.config.scene, gen, Boolean(splatView.mesh));
+      const result = await loadPair(job.config.scene, gen, Boolean(splatView.mesh));
       if (gen !== generation) return;
       if (!EXAMPLES.some(example => example.id === job.id)) {
         const example = {id: job.id, label: job.name, ...job.config.scene};
@@ -188,7 +220,7 @@ async function pollJob(id, gen, sceneReady = Promise.resolve()) {
         settingsMenu.addExample(example);
       }
       settingsMenu.setExampleId(job.id);
-      showStatus('Analysis complete', `${job.name} · ${job.rootCount} top-level records · ${job.recordCount - job.rootCount} parts and contents`, 'complete');
+      showStatus('Analysis complete', `${job.name} · ${inventorySummary(result)}`, 'complete');
       download.href = job.config.scene.annotationsUrl;
       download.classList.remove('hidden');
       return;
@@ -216,7 +248,7 @@ async function analyzeFile(file) {
       showStatus('Scene preview loaded', 'Object analysis is not connected to this viewer.', 'failed');
       return;
     }
-    const id = await uploadScene(file, settingsMenu.getQuality());
+    const id = await uploadScene(file, settingsMenu.getQuality(), settingsMenu.getCameraFiles());
     await pollJob(id, gen, preview);
   } catch (error) {
     if (gen === generation) { hideLoading(); showStatus('Analysis failed', error.message, 'failed'); }
@@ -227,6 +259,7 @@ async function analyzeFile(file) {
 const settingsMenu = new SettingsMenu({
   examples: EXAMPLES, defaultExampleId: EXAMPLES[0]?.id || '',
   onShowContents: checked => { showContents = checked; displayAnnotations(); },
+  onShowUnconfirmedEnvironment: checked => { showUnconfirmedEnvironment = checked; displayAnnotations(); },
   onExampleSelect: id => loadExample(id),
   onSplatFile: file => analyzeFile(file),
   onAnnotationsFile: async file => {

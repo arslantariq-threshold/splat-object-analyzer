@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
-from pipeline import _cluster_detections, _world_box_size
+from pipeline import _cluster_detections, _world_box_size, _postprocess_detection_groups
 from auto_discover import normalise_tag
 from config import PipelineConfig
 from render_cameras import _generate_camera_positions
@@ -29,6 +29,20 @@ for det in repeated_object:
 assert len(_cluster_detections(repeated_object, eps_m=.5)) == 1, 'Overlapping duplicate instances were retained'
 assert normalise_tag(' Bookcase ') == 'bookshelf'
 assert normalise_tag('indoor') is None
+# OWLv2 chooses one winning class per image patch. Added environment queries
+# must not suppress the legacy object result from the same patch.
+import torch
+from types import SimpleNamespace
+from transformers import Owlv2ImageProcessor
+class Processor:
+    def post_process_grounded_object_detection(self, outputs, **kwargs):
+        return Owlv2ImageProcessor().post_process_object_detection(outputs, **kwargs)
+outputs = SimpleNamespace(logits=torch.tensor([[[1., 2., 9.]]]), pred_boxes=torch.tensor([[[.5, .5, .4, .4]]]))
+combined = _postprocess_detection_groups(Processor(), outputs, .1, torch.tensor([[64,64]]), 2)
+legacy = _postprocess_detection_groups(Processor(), SimpleNamespace(logits=outputs.logits[..., :2], pred_boxes=outputs.pred_boxes), .1, torch.tensor([[64,64]]))
+assert combined['labels'].tolist() == [1,2]
+torch.testing.assert_close(combined['scores'][:1], legacy['scores'])
+torch.testing.assert_close(combined['boxes'][:1], legacy['boxes'])
 # A quarter-turn swaps camera X/Z extents in the exported world-aligned box.
 quarter_turn = np.eye(4)
 quarter_turn[:3, :3] = [[0, 0, 1], [0, 1, 0], [-1, 0, 0]]

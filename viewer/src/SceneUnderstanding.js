@@ -23,7 +23,7 @@ export class SceneUnderstanding {
     });
     document.getElementById('show-all-subjects').addEventListener('click', () => {
       this.onSelection(null, this.index);
-      this.selection.textContent = 'Showing all object labels.';
+      this.selection.textContent = 'Showing all subjects allowed by the display settings.';
       this.views.replaceChildren();
     });
     document.getElementById('understanding-toggle').addEventListener('click', event => {

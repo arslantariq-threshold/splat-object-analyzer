@@ -102,6 +102,24 @@
               "default": true,
               "title": "Navigation"
             }
+          },
+          {
+            "name": "camera_limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 64,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Camera Limit"
+            }
           }
         ],
         "responses": {
@@ -213,6 +231,36 @@
               "schema": {
                 "type": "string",
                 "format": "binary"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "file"
+                ],
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Gaussian splat PLY or SPZ"
+                  },
+                  "colmap_images": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Optional matching COLMAP images.txt or images.bin"
+                  },
+                  "colmap_cameras": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Optional cameras.txt calibration; requires colmap_images"
+                  },
+                  "cameras": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Alternative source-space camera JSON; mutually exclusive with COLMAP files"
+                  }
+                }
               }
             }
           }
@@ -1564,6 +1612,16 @@
             "type": "boolean",
             "title": "Understanding Included"
           },
+          "camera_sampling": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CameraSampling"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "navigation": {
             "anyOf": [
               {
@@ -1578,6 +1636,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/SceneSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "environment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EnvironmentSummary"
               },
               {
                 "type": "null"
@@ -1724,6 +1792,61 @@
         ],
         "title": "Camera"
       },
+      "CameraSampling": {
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "colmap_text",
+              "colmap_binary",
+              "camera_json"
+            ],
+            "title": "Format"
+          },
+          "input_pose_count": {
+            "type": "integer",
+            "title": "Input Pose Count"
+          },
+          "candidate_position_count": {
+            "type": "integer",
+            "title": "Candidate Position Count"
+          },
+          "selected_position_count": {
+            "type": "integer",
+            "title": "Selected Position Count"
+          },
+          "selected_image_ids": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "string"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Selected Image Ids"
+          },
+          "orientation": {
+            "type": "string",
+            "const": "perspective_panorama_source_negative_y_up",
+            "title": "Orientation"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "format",
+          "input_pose_count",
+          "candidate_position_count",
+          "selected_position_count",
+          "selected_image_ids",
+          "orientation"
+        ],
+        "title": "CameraSampling"
+      },
       "CoordinateSystem": {
         "properties": {
           "geometry_space": {
@@ -1775,6 +1898,129 @@
         "type": "object",
         "title": "CoordinateSystem"
       },
+      "EnvironmentIssue": {
+        "properties": {
+          "frame_index": {
+            "type": "integer",
+            "title": "Frame Index"
+          },
+          "image_url": {
+            "type": "string",
+            "title": "Image Url"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "structure",
+                  "area"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "frame_index",
+          "image_url",
+          "reason"
+        ],
+        "title": "EnvironmentIssue"
+      },
+      "EnvironmentSummary": {
+        "properties": {
+          "version": {
+            "type": "integer",
+            "title": "Version"
+          },
+          "fingerprint": {
+            "type": "string",
+            "title": "Fingerprint"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "partial"
+            ],
+            "title": "Status"
+          },
+          "entity_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Entity Ids"
+          },
+          "analyzed_view_count": {
+            "type": "integer",
+            "title": "Analyzed View Count"
+          },
+          "evidence_frames": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Evidence Frames"
+          },
+          "failed_views": {
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentIssue"
+            },
+            "type": "array",
+            "title": "Failed Views"
+          },
+          "ungrounded": {
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentIssue"
+            },
+            "type": "array",
+            "title": "Ungrounded"
+          },
+          "limitations": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Limitations"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "version",
+          "fingerprint",
+          "status",
+          "entity_ids",
+          "analyzed_view_count",
+          "evidence_frames",
+          "failed_views",
+          "ungrounded",
+          "limitations"
+        ],
+        "title": "EnvironmentSummary"
+      },
       "ErrorDetail": {
         "properties": {
           "code": {
@@ -1819,6 +2065,44 @@
       },
       "Evidence": {
         "properties": {
+          "box": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array",
+                "maxItems": 4,
+                "minItems": 4
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Box"
+          },
+          "image_width": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image Width"
+          },
+          "image_height": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image Height"
+          },
           "frame_index": {
             "type": "integer",
             "title": "Frame Index"
@@ -2546,6 +2830,56 @@
       },
       "ObjectRecord": {
         "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "object",
+              "structure",
+              "area"
+            ],
+            "title": "Kind",
+            "default": "object"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "geometry_basis": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Geometry Basis"
+          },
+          "surface_samples": {
+            "items": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array",
+              "maxItems": 3,
+              "minItems": 3
+            },
+            "type": "array",
+            "maxItems": 512,
+            "title": "Surface Samples"
+          },
+          "independent_position_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Independent Position Count"
+          },
           "id": {
             "type": "string",
             "title": "Id"

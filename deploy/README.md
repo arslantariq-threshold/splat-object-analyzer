@@ -163,6 +163,7 @@ Configuration in `deploy/.env`:
 | --- | --- |
 | `SPLAT_API_KEY` | Required generated bearer secret; startup rejects the placeholder |
 | `SPLAT_MAX_UPLOAD_BYTES` | `2147483648` (2 GiB) |
+| `SPLAT_MAX_CAMERA_UPLOAD_BYTES` | `536870912` (512 MiB across optional camera files) |
 | `SPLAT_MAX_PENDING_JOBS` | `8` running plus queued jobs |
 | `SPLAT_STAGE_TIMEOUT_SECONDS` | `21600` per model subprocess |
 | `SPLAT_CORS_ORIGINS` | Empty; optional comma-separated browser origins |

@@ -7,7 +7,7 @@ const escapeHtml = value => String(value).replace(/[&<>"']/g, character => ({
 })[character]);
 
 export class SettingsMenu {
-  constructor({ examples, defaultExampleId, onExampleSelect, onSplatFile, onAnnotationsFile, onShowContents }) {
+  constructor({ examples, defaultExampleId, onExampleSelect, onSplatFile, onAnnotationsFile, onShowContents, onShowUnconfirmedEnvironment }) {
     const exampleOptions = examples
       .map(
         (ex) =>
@@ -25,6 +25,7 @@ export class SettingsMenu {
           <div class="stat-line" data-stat="splats">— mio Splats</div>
           <div class="stat-line" data-stat="labels">0 Object records</div>
           <label class="field"><span>Show parts and contents</span><input type="checkbox" data-input="contents"></label>
+          <label class="field"><span>Show unconfirmed environment regions</span><input type="checkbox" data-input="unconfirmed-environment"></label>
         </div>
         <div class="menu">
           <h2>Load scene</h2>
@@ -37,6 +38,13 @@ export class SettingsMenu {
               <option value="">None</option>
               ${exampleOptions}
             </select>
+          </div>
+          <div class="field">
+            <label>Capture cameras (optional)</label>
+            <button class="file-btn" data-target="cameras">Choose COLMAP / camera JSON…</button>
+            <input type="file" accept=".txt,.bin,.json" multiple data-input="cameras">
+            <button class="file-btn" data-clear-cameras hidden>Clear cameras</button>
+            <small>Choose images.txt / images.bin, optionally cameras.txt, or source-space camera JSON before the splat.</small>
           </div>
           <div class="field">
             <label>Gaussian splat</label>
@@ -80,9 +88,25 @@ export class SettingsMenu {
     root.querySelector('[data-input="contents"]').addEventListener('change', (event) => {
       onShowContents(event.target.checked);
     });
+    root.querySelector('[data-input="unconfirmed-environment"]').addEventListener('change', event => {
+      onShowUnconfirmedEnvironment?.(event.target.checked);
+    });
 
     this._wireInput(root, "splat", "Choose .ply / .spz…", onSplatFile);
     this._wireInput(root, "json", "Choose .json…", onAnnotationsFile);
+    this._cameraFiles = [];
+    const cameraButton = root.querySelector('[data-target="cameras"]');
+    const cameraInput = root.querySelector('[data-input="cameras"]');
+    const clearCameras = root.querySelector('[data-clear-cameras]');
+    cameraButton.addEventListener('click', () => { cameraInput.value = ''; cameraInput.click(); });
+    cameraInput.addEventListener('change', () => {
+      if (!cameraInput.files.length) return;
+      this._cameraFiles = [...cameraInput.files];
+      cameraButton.textContent = this._cameraFiles.map(file => file.name).join(', ');
+      cameraButton.classList.add('loaded');
+      clearCameras.hidden = false;
+    });
+    clearCameras.addEventListener('click', () => this.clearCameras());
   }
 
   updateStats(stats) {
@@ -94,6 +118,14 @@ export class SettingsMenu {
   clearFileSelections() {
     this._resetFileField("splat", "Choose .ply / .spz…");
     this._resetFileField("json", "Choose .json…");
+    this.clearCameras();
+  }
+
+  getCameraFiles() { return [...this._cameraFiles]; }
+  clearCameras() {
+    this._cameraFiles = [];
+    this._resetFileField('cameras', 'Choose COLMAP / camera JSON…');
+    this._root.querySelector('[data-clear-cameras]').hidden = true;
   }
 
   setExampleId(id) {

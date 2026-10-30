@@ -17,6 +17,7 @@ import uuid
 
 from understanding_jobs import UnderstandingJobs
 from pipeline_progress import progress_from_line
+from upload_bundle import BundleUpload, MAX_CAMERA_UPLOAD
 
 
 ROOT = Path(__file__).resolve().parent
@@ -99,7 +100,7 @@ class AnalysisJobs:
                     job['previewCamera'] = frame_camera(best['transform_matrix'])
                 except (OSError, ValueError, KeyError):
                     pass  # Render metadata may not have been written completely yet.
-            public = {k: v for k, v in job.items() if k not in {'source', 'output'}}
+            public = {k: v for k, v in job.items() if k not in {'source', 'output', 'camera_input'}}
             if job['status'] != 'uploading':
                 public['splatUrl'] = f'/api/jobs/{job_id}/scene{job["source"].suffix}'
             return public
@@ -131,6 +132,8 @@ class AnalysisJobs:
             # run.sh configures the venv tools and model caches consistently with CLI runs.
             command = ['/bin/sh', str(ROOT / 'run.sh'), '--ply', str(job['source']),
                        '--quality', job['quality'], '--job_dir', str(job['output'])]
+            if job.get('camera_input'):
+                command.extend(['--cameras', str(job['camera_input'])])
             with log_path.open('w') as log:
                 with subprocess.Popen(command, cwd=ROOT, env=os.environ.copy(),
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
@@ -211,6 +214,7 @@ def handler_for(jobs, port):
             query = parse_qs(url.query)
             name = Path(query.get('filename', ['scene'])[0].replace('\\', '/')).name[:200]
             quality = query.get('quality', ['high'])[0]
+            multipart = self.headers.get('Content-Type', '').split(';')[0].lower() == 'multipart/form-data'
             try:
                 size = int(self.headers.get('Content-Length', '0'))
             except ValueError:
@@ -218,7 +222,7 @@ def handler_for(jobs, port):
             if Path(name).suffix.lower() not in {'.ply', '.spz'} or quality not in {'low', 'medium', 'high'}:
                 self.json_response({'error': 'Choose a .ply or .spz file and a valid quality setting'}, 400)
                 return
-            if size <= 0 or size > MAX_UPLOAD:
+            if size <= 0 or size > MAX_UPLOAD + (MAX_CAMERA_UPLOAD + 65536 if multipart else 0):
                 self.json_response({'error': 'Choose a nonempty file smaller than 2 GiB'}, 413)
                 return
             try:
@@ -226,15 +230,28 @@ def handler_for(jobs, port):
             except RuntimeError as error:
                 self.json_response({'error': str(error)}, 409)
                 return
+            bundle = None
             try:
                 remaining = size
-                with job['source'].open('wb') as destination:
+                if multipart:
+                    bundle = BundleUpload(self.headers['Content-Type'], job['source'], MAX_UPLOAD)
                     while remaining:
                         block = self.rfile.read(min(1024**2, remaining))
                         if not block:
                             raise ValueError('The upload was interrupted')
-                        destination.write(block)
+                        bundle.write(block)
                         remaining -= len(block)
+                    camera_input = bundle.finish()
+                    if camera_input:
+                        job['camera_input'] = camera_input['path']
+                else:
+                    with job['source'].open('wb') as destination:
+                        while remaining:
+                            block = self.rfile.read(min(1024**2, remaining))
+                            if not block:
+                                raise ValueError('The upload was interrupted')
+                            destination.write(block)
+                            remaining -= len(block)
                 with job['source'].open('rb') as source:
                     magic = source.read(4)
                 if ((job['source'].suffix == '.ply' and not magic.startswith(b'ply')) or
@@ -242,8 +259,11 @@ def handler_for(jobs, port):
                     raise ValueError('The file contents do not match a supported Gaussian splat format')
             except Exception as error:
                 jobs.fail(job['id'], str(error))
-                self.json_response({'error': str(error)}, 400)
+                self.json_response({'error': str(error)}, getattr(error, 'status', 400))
                 return
+            finally:
+                if bundle:
+                    bundle.close()
             threading.Thread(target=jobs.run, args=(job['id'],), daemon=True).start()
             self.json_response({'id': job['id']}, 202)
 

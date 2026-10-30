@@ -307,6 +307,7 @@ button:disabled, select:disabled { opacity: .55; cursor: wait; }
 }
 .file-btn:hover { border-color: var(--accent); }
 .file-btn.loaded { border-color: var(--accent); color: var(--text); }
+.file-btn[hidden] { display: none; }
 
 .field input[type="file"] { display: none; }
 

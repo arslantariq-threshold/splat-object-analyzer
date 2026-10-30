@@ -21,9 +21,10 @@ with tempfile.TemporaryDirectory() as temporary:
     script.write_text('''import argparse, hashlib, json, time
 from pathlib import Path
 p=argparse.ArgumentParser()
-p.add_argument('--ply');p.add_argument('--quality');p.add_argument('--job_dir')
+p.add_argument('--ply');p.add_argument('--quality');p.add_argument('--job_dir');p.add_argument('--cameras')
 a=p.parse_args();source=Path(a.ply)
 out=Path(a.job_dir);out.mkdir()
+if a.cameras:(out/'capture-input.json').write_text(Path(a.cameras).read_text())
 (out/'transforms.json').write_text(json.dumps({'frames':[{'quality':{'score':1},'transform_matrix':[[1,0,0,1],[0,1,0,2],[0,0,1,3],[0,0,0,1]]}]}))
 print('[discover] 1/4 views; 2 labels discovered', flush=True)
 time.sleep(.35)
@@ -102,6 +103,18 @@ out.write_text(json.dumps(dict(source_hash=r['input']['sha256'],shots=[dict(imag
         state, _, _ = wait(failed['id'])
         assert state['status'] == 'failed' and 'unsupported test scene' in state['error']
         assert jobs.active is None
+        boundary = 'capture-upload-test-boundary'
+        camera_json = json.dumps(dict(space='source', positions=[[1,2,3],[4,5,6]])).encode()
+        chunks = []
+        for field, filename, content in [('file','capture.ply',b'ply\nvalid'), ('cameras','cameras.json',camera_json)]:
+            chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{filename}"\r\n\r\n'.encode()+content+b'\r\n')
+        payload = b''.join(chunks)+f'--{boundary}--\r\n'.encode()
+        code, capture = request('/api/jobs?filename=capture.ply', payload, {**headers,'Content-Type':'multipart/form-data; boundary='+boundary})
+        assert code == 202
+        state, _, _ = wait(capture['id'])
+        assert state['status'] == 'complete', state
+        assert 'camera_input' not in state
+        assert json.loads((jobs.jobs[capture['id']]['output']/'capture-input.json').read_text())['poses'][0]['position']==[1,2,3]
         assert analysis_server.progress_from_line('[identity] Segmented 3/10 views')['completed'] == 3
         assert analysis_server.progress_from_line('[detect] Processed 7/90 views')['total'] == 90
         assert analysis_server.progress_from_line('arbitrary warning') is None

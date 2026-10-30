@@ -7,7 +7,8 @@ results. It does not serve the prototype frontend.
 
 Input a Gaussian splat (`.spz` or standard 3DGS `.ply`) and get an object inventory
 with labels, 3D positions, bounding boxes, supporting images, and parent/child
-relationships. Object names are discovered automatically.
+relationships. It also discovers major structures and spatial areas, such as houses,
+façades, gardens and driveways, from a survey of rendered views. Names are discovered automatically.
 
 This is the standalone research prototype developed from
 [Nigel Hartman's Splat Analyzer](https://github.com/nigelhartman/splat_analyzer),
@@ -73,11 +74,117 @@ An optional targeted search remains available:
 ./analyze-splat.sh /path/to/scene.spz --prompt "painting, chair, table"
 ```
 
-The first analysis downloads the pretrained RAM++, OWLv2, SAM, and tokenizer
+### Use capture cameras (optional)
+
+Splat-only runs keep automatic camera placement. To use a matching COLMAP model:
+
+```bash
+./analyze-splat.sh /path/to/scene.ply --colmap-model /path/to/colmap-model --quality high
+```
+
+The model directory can contain `images.txt` or `images.bin`; binary is preferred
+when both exist. An `images` file can also be passed directly. Original photographs
+and `points3D.txt` are not needed. Optional `cameras.txt` checks sensor references.
+Camera inputs must use the unmodified splat's source coordinates.
+
+For a camera list, use `--cameras /path/to/cameras.json` with
+`{"space":"source","positions":[[1,-1,2],[2,-1,3]]}`. Nearby capture locations,
+including adjacent video frames and front/back lenses, are reduced through spatial
+sampling. Preview quality and visible-surface coverage choose the final subset.
+Quality selects up to 3/5/8 locations for low/medium/high; `--camera-limit 12`
+overrides that maximum (1–64). The existing per-location perspective sweeps and
+final image validation are retained. Analysis uses fresh perspective orientations
+with source negative-Y up, so capture roll and fisheye distortion are not inherited.
+
+Default capture output folders include the camera fingerprint, quality and limit
+to keep caches separate. When changing camera inputs/settings with an explicit
+`--job_dir`, choose a fresh folder. Supplied-camera validation failures do not
+silently fall back to generated locations. `camera_diagnostics.json` and
+`transforms.json` record sampling counts and selected source image IDs.
+
+In the local viewer, choose **Capture cameras (optional)** before choosing the
+splat. Clear that selection to restore automatic placement. API uploads accept
+optional camera files as multipart parts; see [API.md](API.md#optional-capture-cameras).
+
+The first analysis downloads the pretrained Qwen2.5-VL, RAM++, OWLv2, SAM, and tokenizer
 files (several GB). They stay in `.cache/` and are excluded from Git.
 Set `HF_HOME` to reuse an existing Hugging Face cache. After the models are
 cached, set `HF_HUB_OFFLINE=1` for an offline analysis run. Model inference runs
 locally; the input scene is not uploaded to a model service.
+
+### Environment understanding
+
+Environment discovery runs automatically with either camera-placement mode. Up to
+12 accepted views are selected using both position and viewing direction. The
+existing pinned local Qwen2.5-VL model proposes structures/areas and reconciles an
+overall scene summary across views. OWLv2 independently locates the proposed
+concepts across the rendered views; the normal object pass reuses the same model
+forward pass with independent class selection to preserve its detections. SAM masks
+and rendered depth supply all 3D geometry. Model-generated
+coordinates are never used. No new model dependency or hosted model key is required.
+
+`interactions.json.environment` contains:
+
+- `scene`: multi-view environment type, description and inference confidence;
+- `entities`: stable IDs, `kind` (`structure` or `area`), names/attributes, observed
+  bounds, sampled surfaces, supporting masks/views, and independent camera count;
+- `relations`: conservative visible-surface part links and structure/area adjacency;
+- `ungrounded` and `failed_views`: observations excluded from spatial results and
+  incomplete model stages, with reasons and source frame IDs.
+
+Environment identity is resolved across a graph of segmented observations,
+including links through overlapping partial views. Every component preserves
+conflicting appearances and distinct co-visible instances; proximity or a shared
+label alone cannot merge them. Cross-view links also check rendered depth and
+mask visibility. Sampling and match distances are bounded by local image/surface
+resolution so a large outdoor scan does not blur identities of smaller subjects.
+Observed surface points are averaged within sampling cells rather than moved to
+grid-cell centers. This logic is shared by all environment categories and both
+camera-placement modes.
+
+Only segmented, coherent depth surfaces enter `entities`. At least two capture
+locations must support an entity for `status=supported`; single-location evidence
+is retained as `uncertain`. Automatic tours use supported environment subjects;
+uncertain observations remain available for inspection. Surface association checks
+geometry, depth-consistent reprojection and co-visible masks, and avoids combining
+conflicting exterior colors. Environment mask work is bounded to 384 candidates
+across at most 192 accepted views. Indoor context can propose a floor search; the
+result still needs independent detection, segmentation and depth validation. Separate non-overlapping
+façades may remain fragmented. This is an approximate, observed-surface model:
+it does not reconstruct unseen building volumes, establish gravity, or make an
+area safe for camera travel. Use the independent navigation map for movement.
+
+The local viewer includes environment subjects in its annotations and semantic
+queries. The API exposes them in `objects` with a `kind` discriminator, alongside
+an `environment` coverage report, relations, and individual observed camera views.
+The local viewer shows supported environment subjects by default and reports
+unconfirmed regions separately. Settings → **Show unconfirmed environment
+regions** reveals the remaining hypotheses with their status. Downloaded results
+retain every region. **Show all labels** clears prompt filtering while preserving
+this display setting. These filters do not consolidate geometry or replace
+instance association. Existing observed-surface part links are respected by
+**Show parts and contents**, so a structural part is not shown as a second
+top-level subject. Parts remain visible if their proposed parent is unconfirmed
+and hidden.
+Splat Studio can filter structures/areas/objects, optionally include uncertain
+environment observations, inspect supporting images, and highlight the selected
+subject's sampled surface. The later semantic pass reviews supported environment
+subjects from masked crops to refine their names and distinguish visible appearance. The director receives these
+subjects and relationships through its existing scene tools.
+
+For an existing result with RGB/depth views and `object_surfaces.npz`, add or refresh
+this stage without repeating object detection:
+
+```bash
+.venv/bin/python environment_understanding.py --result ./outputs/my-scene/interactions.json
+```
+
+`--views 8` changes this standalone survey budget (1–32). Full runs can use
+`--no-environment` to retain object-only processing. API `understanding=false`
+skips both environment discovery and the later semantic-description stage.
+Environment observations and image detections are cached against the source,
+rendered camera metadata, model revisions and survey budget. Reanalysis is needed
+to enrich an older object-only result.
 
 ## View results
 
@@ -272,7 +379,7 @@ excluded, so boxes may cover only the supported visible part of an object.
    detail relative to the scene's clearer previews, then select for
    visible-surface coverage and spatial separation. Render the final 90-degree
    sweeps and reject views dominated by near surfaces or empty background.
-2. RAM++ generates object labels from the views.
+2. Qwen surveys structures/areas and the global environment; RAM++ generates object labels from the views.
 3. OWLv2 locates the labels in each image; depth lifts detections into 3D.
 4. SAM segments candidate regions. Visible 3D surfaces associate repeated views
    and compatible names with an instance, instead of relying on box centres alone.

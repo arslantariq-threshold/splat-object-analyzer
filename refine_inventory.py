@@ -166,7 +166,7 @@ def merge_nodes(nodes, voxel_size):
     return groups
 
 
-def _segment_candidates(objects, root, transforms, device, fingerprint):
+def _segment_candidates(objects, root, transforms, device, fingerprint, progress=None):
     import torch
     from transformers import SamModel, SamProcessor
 
@@ -192,6 +192,8 @@ def _segment_candidates(objects, root, transforms, device, fingerprint):
 
     pending = sum(not path.exists() for items in requests.values() for _, _, path in items)
     print(f'[identity] SAM: {pending} uncached masks across {len(requests)} views on {device}', flush=True)
+    if progress:
+        progress('Segmenting environment subjects', 0, len(requests))
     processor = model = None
     if pending:
         processor = SamProcessor.from_pretrained(SAM_MODEL, revision=SAM_REVISION)
@@ -231,7 +233,10 @@ def _segment_candidates(objects, root, transforms, device, fingerprint):
                     observations[object_id].append({'frame': frame_idx, 'mask': mask, 'points': points,
                                                      'quality': quality, 'path': str(path.relative_to(root))})
             if (number + 1) % 10 == 0 or number + 1 == len(requests):
-                print(f'[identity] Segmented {number + 1}/{len(requests)} views', flush=True)
+                if progress:
+                    progress('Segmenting environment subjects', number + 1, len(requests))
+                else:
+                    print(f'[identity] Segmented {number + 1}/{len(requests)} views', flush=True)
     finally:
         del model
         gc.collect()

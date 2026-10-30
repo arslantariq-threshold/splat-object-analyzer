@@ -27,6 +27,7 @@ from api.schemas import (AnalysisResult, ErrorResponse, Job, QueryRequest, Query
     NavigationSummary, NavigationGridResult, NavigationValidationRequest, NavigationValidation, NavigationPathRequest, NavigationPath)
 from api.storage import QueueFull, Store, now
 from api.worker import Worker
+from upload_bundle import BundleUpload, UploadError, MAX_CAMERA_UPLOAD
 
 ROOT = Path(__file__).resolve().parent
 JobId = Annotated[str, PathParam(pattern=r'^[a-f0-9]{32}$')]
@@ -50,6 +51,7 @@ class Settings:
     stage_timeout_seconds: int = 21600
     cors_origins: tuple[str, ...] = ()
     require_cuda: bool = False
+    max_camera_upload_bytes: int = MAX_CAMERA_UPLOAD
 
     @classmethod
     def from_env(cls):
@@ -58,7 +60,8 @@ class Settings:
             max_pending_jobs=int(os.getenv('SPLAT_MAX_PENDING_JOBS', '8')),
             stage_timeout_seconds=int(os.getenv('SPLAT_STAGE_TIMEOUT_SECONDS', '21600')),
             cors_origins=tuple(s.strip() for s in os.getenv('SPLAT_CORS_ORIGINS', '').split(',') if s.strip()),
-            require_cuda=os.getenv('SPLAT_REQUIRE_CUDA', '0') == '1')
+            require_cuda=os.getenv('SPLAT_REQUIRE_CUDA', '0') == '1',
+            max_camera_upload_bytes=int(os.getenv('SPLAT_MAX_CAMERA_UPLOAD_BYTES', str(MAX_CAMERA_UPLOAD))))
 
 
 class APIError(Exception):
@@ -79,7 +82,7 @@ def create_app(settings=None, app_root=ROOT):
     async def lifespan(app):
         if len(settings.api_key) < 32 or settings.api_key.startswith('replace-'):
             raise RuntimeError('Set SPLAT_API_KEY to a random secret of at least 32 characters before starting the API')
-        if min(settings.max_upload_bytes, settings.max_pending_jobs, settings.stage_timeout_seconds) <= 0:
+        if min(settings.max_upload_bytes, settings.max_camera_upload_bytes, settings.max_pending_jobs, settings.stage_timeout_seconds) <= 0:
             raise RuntimeError('Upload, queue, and timeout limits must be positive')
         if settings.require_cuda:
             subprocess.run([sys.executable, '-c', 'import torch; assert torch.cuda.is_available(), "CUDA GPU is unavailable"'], check=True)
@@ -152,21 +155,34 @@ def create_app(settings=None, app_root=ROOT):
             yield
 
     @router.post('/analyses', response_model=Job, status_code=202, tags=['analysis'], dependencies=[Depends(upload_slot)],
-        openapi_extra={'requestBody':{'required':True,'content':{'application/octet-stream':{'schema':{'type':'string','format':'binary'}}}}})
+        openapi_extra={'requestBody':{'required':True,'content':{
+            'application/octet-stream':{'schema':{'type':'string','format':'binary'}},
+            'multipart/form-data':{'schema':{'type':'object','required':['file'],'properties':{
+                name:{'type':'string','format':'binary','description':description} for name, description in {
+                    'file':'Gaussian splat PLY or SPZ', 'colmap_images':'Optional matching COLMAP images.txt or images.bin',
+                    'colmap_cameras':'Optional cameras.txt calibration; requires colmap_images',
+                    'cameras':'Alternative source-space camera JSON; mutually exclusive with COLMAP files'}.items()}}}}}})
     async def submit(request: Request, filename: str = Query(min_length=5, max_length=180),
-                     quality: Literal['low','medium','high'] = 'high', understanding: bool = True, navigation: bool = True):
+                     quality: Literal['low','medium','high'] = 'high', understanding: bool = True, navigation: bool = True,
+                     camera_limit: int | None = Query(default=None, ge=1, le=64)):
         if app.state.store.pending_count() >= settings.max_pending_jobs:
             raise APIError(429, 'queue_full', 'The processing queue is full. Retry later.')
         if (Path(filename).name != filename or '\\' in filename or any(ord(c) < 32 for c in filename) or
             Path(filename).suffix.lower() not in ('.ply','.spz')):
             raise APIError(400, 'invalid_file', 'Provide a plain .ply or .spz filename')
-        if request.headers.get('content-type', '').split(';')[0].lower() != 'application/octet-stream':
-            raise APIError(415, 'invalid_content_type', 'Send the file as application/octet-stream')
+        content_type = request.headers.get('content-type', '')
+        multipart = content_type.split(';')[0].lower() == 'multipart/form-data'
+        if not multipart and content_type.split(';')[0].lower() != 'application/octet-stream':
+            raise APIError(415, 'invalid_content_type', 'Send application/octet-stream or multipart/form-data')
+        if camera_limit is not None and not multipart:
+            raise APIError(400, 'invalid_camera_input', 'camera_limit requires a multipart upload with camera files')
         try:
             length = int(request.headers.get('content-length', '0'))
         except ValueError:
             raise APIError(400, 'invalid_content_length', 'Invalid Content-Length')
-        if length > settings.max_upload_bytes:
+        if length < 0:
+            raise APIError(400, 'invalid_content_length', 'Invalid Content-Length')
+        if length > settings.max_upload_bytes + (settings.max_camera_upload_bytes + 65536 if multipart else 0):
             raise APIError(413, 'file_too_large', 'File exceeds the configured upload limit')
         job_id = uuid.uuid4().hex
         directory = app.state.store.directory(job_id)
@@ -175,22 +191,41 @@ def create_app(settings=None, app_root=ROOT):
         partial = directory/'upload.partial'
         accepted = False
         size, magic, digest = 0, b'', hashlib.sha256()
+        bundle, camera_input = None, None
         try:
-            with partial.open('xb') as destination:
-                async for chunk in request.stream():
-                    size += len(chunk)
-                    if size > settings.max_upload_bytes:
-                        raise APIError(413, 'file_too_large', 'File exceeds the configured upload limit')
-                    magic = (magic+chunk[:4])[:4]
-                    digest.update(chunk)
-                    await run_in_threadpool(destination.write, chunk)
+            if multipart:
+                try:
+                    bundle = BundleUpload(content_type, partial, settings.max_upload_bytes, settings.max_camera_upload_bytes)
+                    async for chunk in request.stream():
+                        await run_in_threadpool(bundle.write, chunk)
+                    camera_input = await run_in_threadpool(bundle.finish)
+                    size, magic, digest = bundle.size, bundle.magic, bundle.digest
+                except (ValueError, OverflowError) as error:
+                    raise APIError(getattr(error, 'status', 400), getattr(error, 'code', 'invalid_file'), str(error)) from error
+                finally:
+                    if bundle:
+                        bundle.close()
+            else:
+                with partial.open('xb') as destination:
+                    async for chunk in request.stream():
+                        size += len(chunk)
+                        if size > settings.max_upload_bytes:
+                            raise APIError(413, 'file_too_large', 'File exceeds the configured upload limit')
+                        magic = (magic+chunk[:4])[:4]
+                        digest.update(chunk)
+                        await run_in_threadpool(destination.write, chunk)
             if not size or (suffix == 'ply' and not magic.startswith(b'ply')) or (suffix == 'spz' and not magic.startswith(b'\x1f\x8b')):
                 raise APIError(400, 'invalid_file', 'The file contents do not match the requested Gaussian splat format')
             partial.replace(directory/('source.'+suffix))
+            if camera_limit is not None and camera_input is None:
+                raise APIError(400, 'invalid_camera_input', 'camera_limit requires camera files')
             record = dict(id=job_id, kind='analysis', analysis_id=job_id, status='queued', created_at=now(),
                 started_at=None, finished_at=None, progress=dict(stage='Queued',completed=None,total=None), error=None,
                 filename=filename, format=suffix, bytes=size, sha256=digest.hexdigest(), quality=quality, understanding=understanding,
                 navigation=navigation)
+            if camera_input:
+                record.update(camera_input_sha256=camera_input['sha256'], camera_input_format=camera_input['format'],
+                              camera_input_pose_count=camera_input['input_pose_count'], camera_limit=camera_limit)
             try:
                 app.state.store.create(record)
             except QueueFull:

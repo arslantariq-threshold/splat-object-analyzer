@@ -31,6 +31,7 @@ from scipy.spatial import cKDTree
 
 from config import PipelineConfig, QUALITY_PRESETS, DEFAULT_QUALITY
 from renderers import get_renderer
+from camera_inputs import load_camera_input, camera_fingerprint, add_camera_arguments
 
 # Number of camera views rendered in a single GPU call (RGB pass).
 # Increase if you have lots of VRAM; decrease if you hit OOM.
@@ -371,8 +372,17 @@ def _select_preview_positions(candidates, surfaces, scores, n_positions, min_sep
 
 
 def _preview_camera_positions(means, renderer, g, cfg, diagnostics_path=None):
-    candidates, targets = _generate_camera_positions(means, max(cfg.camera_candidates, cfg.n_positions), cfg)
+    supplied = None
+    if cfg.camera_input:
+        candidates, targets, supplied = _provided_camera_positions(means, cfg)
+    else:
+        candidates, targets = _generate_camera_positions(means, max(cfg.camera_candidates, cfg.n_positions), cfg)
     _, _, diag, clearance, _ = _camera_geometry(means, cfg)
+    if supplied:
+        # A reconstructed capture centre need not sit in the large open voids
+        # used by the automatic sampler. Judge Gaussian opacity/extents through
+        # depth previews, not proximity to a possibly floating Gaussian centre.
+        clearance = max(diag * .002, .01)
     size = cfg.preview_size
     focal = size / (2 * math.tan(math.radians(cfg.fov_x_degrees) / 2))
     K = torch.tensor([[focal, 0, size / 2], [0, focal, size / 2], [0, 0, 1]],
@@ -380,6 +390,8 @@ def _preview_camera_positions(means, renderer, g, cfg, diagnostics_path=None):
     poses, _ = _build_poses(candidates, 4, 1, el_min=0, el_max=0)
     surfaces, quality = [set() for _ in candidates], [[] for _ in candidates]
     report = {'clearance': clearance, 'candidate_count': len(candidates), 'candidates': []}
+    if supplied:
+        report['camera_input'] = supplied
     print(f'[render] Validating {len(candidates)} candidates with four {size}px previews each')
     for b0 in range(0, len(poses), RENDER_BATCH):
         batch = torch.tensor(np.stack(poses[b0:b0 + RENDER_BATCH]),
@@ -398,9 +410,12 @@ def _preview_camera_positions(means, renderer, g, cfg, diagnostics_path=None):
     for i, metrics in enumerate(quality):
         # Three usable horizontal directions help reject cameras outside a room.
         good = [m['score'] for m in metrics if m['accepted']]
-        score = float(np.mean(good)) if len(good) >= 3 else 0.
+        score = float(np.mean(good)) if len(good) >= (1 if supplied else 3) else 0.
         scores.append(score)
-        report['candidates'].append({'position': candidates[i].tolist(), 'score': score, 'views': metrics})
+        candidate = {'position': candidates[i].tolist(), 'score': score, 'views': metrics}
+        if supplied:
+            candidate['source_image_id'] = supplied['candidate_image_ids'][i]
+        report['candidates'].append(candidate)
     # ponytail: relative sharpness is a room-scan heuristic, not proof of occupancy.
     # Reject smeared through-wall views before coverage novelty can reward them.
     nonzero = [s for s in scores if s > 0]
@@ -411,19 +426,65 @@ def _preview_camera_positions(means, renderer, g, cfg, diagnostics_path=None):
             report['candidates'][i]['score'] = 0.
             report['candidates'][i]['rejection_reason'] = 'insufficient_image_detail'
     report['detail_cutoff'] = detail_cutoff
-    chosen = _select_preview_positions(candidates, surfaces, scores, cfg.n_positions,
+    limit = (cfg.camera_limit or cfg.n_positions) if supplied else cfg.n_positions
+    chosen = _select_preview_positions(candidates, surfaces, scores, limit,
                                        cfg.min_sep_frac * diag)
     report.update({'valid_candidates': sum(s > 0 for s in scores), 'selected_indices': chosen,
-                   'requested_positions': cfg.n_positions, 'selected_positions': len(chosen)})
+                   'requested_positions': limit, 'selected_positions': len(chosen)})
+    if supplied:
+        supplied['selected_image_ids'] = [supplied['candidate_image_ids'][i] for i in chosen]
     if diagnostics_path is not None:
         Path(diagnostics_path).write_text(json.dumps(report, indent=2) + '\n')
     if not chosen:
-        raise ValueError('No camera candidates passed preview validation; refusing to analyze obstructed views')
-    print(f'[render] Selected {len(chosen)}/{cfg.n_positions} cameras from '
+        raise ValueError('No camera candidates passed preview validation; check the supplied cameras match the splat source coordinates' if supplied else
+                         'No camera candidates passed preview validation; refusing to analyze obstructed views')
+    print(f'[render] Selected {len(chosen)}/{limit} cameras from '
           f'{report["valid_candidates"]} preview-valid candidates')
-    if len(chosen) < cfg.n_positions:
+    if len(chosen) < limit:
         print('[render] WARNING: insufficient valid camera positions; reducing coverage rather than using unsafe fallback')
     return candidates[chosen], targets[chosen], report, clearance, diag
+
+
+def _provided_camera_positions(means, cfg):
+    """Bound preview work and merge nearby capture centres before GPU inference.
+
+    Front/back lenses and adjacent video frames are often almost co-located.
+    Greedy spatial coverage keeps distinct locations instead of every Nth image.
+    RGB/depth previews still decide which of these locations are usable.
+    """
+    if cfg.camera_limit is not None and not 1 <= cfg.camera_limit <= 64:
+        raise ValueError('camera_limit must be between 1 and 64')
+    model = load_camera_input(cfg.camera_input)
+    _, _, diag, clearance, tree = _camera_geometry(means, cfg)
+    positions = np.asarray([p['position'] for p in model['poses']], dtype=np.float64)
+    distances, _ = tree.query(positions)
+    valid = np.flatnonzero(distances <= diag)
+    if not len(valid):
+        raise ValueError('No supplied capture locations are near the scene; check COLMAP/splat alignment and source coordinates')
+    pool = positions[valid]
+    cap = max(cfg.camera_candidates, cfg.camera_limit or cfg.n_positions)
+    cap = min(cap, 256)  # bounded preview work even for very long captures
+    selected = []
+    separation = np.full(len(pool), np.inf)
+    for _ in range(min(cap, len(pool))):
+        if not selected:
+            pick = int(np.argmin(np.linalg.norm(pool - np.median(pool, axis=0), axis=1)))
+        else:
+            pick = int(np.argmax(separation))
+            if separation[pick] < max(cfg.min_sep_frac * diag, 1e-6):
+                break
+        selected.append(pick)
+        separation = np.minimum(separation, np.linalg.norm(pool - pool[pick], axis=1))
+        separation[selected] = -1
+    indices = valid[selected]
+    candidates = positions[indices].astype(np.float32)
+    _, nearest = tree.query(candidates, k=min(64, tree.n))
+    targets = tree.data[np.asarray(nearest).reshape(len(candidates), -1)].mean(axis=1)
+    report = dict(format=model['format'], sha256=camera_fingerprint(model), input_pose_count=len(positions),
+                  near_scene_pose_count=len(valid), candidate_image_ids=[model['poses'][i]['id'] for i in indices],
+                  orientation='perspective_panorama_source_negative_y_up')
+    print(f'[render] Supplied {len(positions)} poses -> {len(candidates)} spaced capture candidates (maximum {cap})')
+    return candidates, targets.astype(np.float32), report
 
 
 def _build_poses(positions: list, n_azimuth: int, n_elevation: int,
@@ -497,9 +558,24 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None,
     overlapping with the next GPU batch.
     """
     cfg = cfg or PipelineConfig()
+    if cfg.camera_limit is not None and not cfg.camera_input:
+        raise ValueError('camera_limit requires a camera input')
     width, height = cfg.width, cfg.height
     n_positions, n_azimuth, n_elevation = cfg.n_positions, cfg.n_azimuth, cfg.n_elevation
     job_dir = Path(job_dir)
+    camera_hash = camera_fingerprint(load_camera_input(cfg.camera_input)) if cfg.camera_input else None
+    capture_settings = {key: getattr(cfg, key) for key in ('quality', 'camera_limit', 'camera_candidates', 'min_sep_frac',
+        'fov_x_degrees', 'width', 'height', 'n_positions', 'n_azimuth', 'n_elevation')} if cfg.camera_input else None
+    if (job_dir/'transforms.json').exists():
+        try:
+            previous = json.loads((job_dir/'transforms.json').read_text())
+        except ValueError:
+            if cfg.camera_input:
+                raise ValueError('This output directory has incomplete render metadata; choose a fresh job_dir for capture analysis')
+            previous = {}  # Preserve automatic reruns after an interrupted render.
+        previous_hash = previous.get('camera_validation', {}).get('camera_input', {}).get('sha256')
+        if previous_hash != camera_hash or (camera_hash and previous.get('capture_settings') != capture_settings):
+            raise ValueError('This output directory contains different camera inputs/settings; choose a fresh job_dir to avoid stale analysis caches')
     frames_dir = job_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
@@ -556,7 +632,7 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None,
         "w": width, "h": height,
         "scene_center": center.tolist(),
         "scene_radius": float(radius),
-        "camera_placement": "preview_validated_surface_coverage",
+        "camera_placement": "provided_capture_surface_coverage" if cfg.camera_input else "preview_validated_surface_coverage",
         "camera_validation": placement,
         "fov_x_degrees": cfg.fov_x_degrees,
         "camera_positions": [p.tolist() for p in cam_positions],
@@ -565,6 +641,8 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None,
         "frames": [],
         "rejected_views": [],
     }
+    if cfg.camera_input:
+        transforms['capture_settings'] = capture_settings
 
     futures = []
 
@@ -628,7 +706,9 @@ if __name__ == "__main__":
                         default=DEFAULT_QUALITY)
     parser.add_argument("--width",   type=int, default=512)
     parser.add_argument("--height",  type=int, default=512)
+    add_camera_arguments(parser)
     args = parser.parse_args()
     cfg = PipelineConfig.from_overrides(quality=args.quality,
-                                        width=args.width, height=args.height)
+                                        width=args.width, height=args.height,
+                                        camera_input=args.camera_input, camera_limit=args.camera_limit)
     render_views(args.ply, args.job_dir, cfg)

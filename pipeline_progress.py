@@ -1,8 +1,11 @@
 """Shared progress messages for the local viewer and standalone API."""
 import re
+import json
 
 
 def progress_from_line(line):
+    if line.startswith('[environment] '):
+        return json.loads(line[len('[environment] '):])
     if '[navigation]' in line:
         stage = 'Estimating camera space'
     elif '[render]' in line or '[pipeline] Step 1' in line or '[spz]' in line:

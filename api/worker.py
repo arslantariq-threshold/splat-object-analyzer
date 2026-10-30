@@ -163,11 +163,18 @@ class Worker:
             # interactions.json is atomically published only after analysis finishes.
             # Restarted semantic jobs reuse that checkpoint and their caption cache.
             checkpoint = json.loads(inventory_path.read_text()) if inventory_path.exists() else None
-            if not checkpoint or checkpoint.get('input', {}).get('sha256') != record['sha256']:
+            if (not checkpoint or checkpoint.get('input', {}).get('sha256') != record['sha256'] or
+                checkpoint.get('input', {}).get('camera_input_sha256') != record.get('camera_input_sha256')):
                 arguments = [self.app_root/'run_local.py', '--ply', directory/('source.'+record['format']),
                     '--quality', record['quality'], '--job_dir', output]
+                if not record['understanding']:
+                    arguments.append('--no-environment')
                 if not record.get('navigation', True):
                     arguments.append('--no-navigation')
+                if record.get('camera_input_sha256'):
+                    arguments.extend(['--cameras', directory/'camera_input.json'])
+                    if record.get('camera_limit') is not None:
+                        arguments.extend(['--camera-limit', record['camera_limit']])
                 self.command(record, arguments)
             inventory = json.loads(inventory_path.read_text())
             transforms = json.loads((output/'transforms.json').read_text())

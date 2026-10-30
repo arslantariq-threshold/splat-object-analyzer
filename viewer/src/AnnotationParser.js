@@ -37,7 +37,10 @@ export class AnnotationParser {
 
   static fromText(text) {
     const data = JSON.parse(text);
-    const objects = Array.isArray(data) ? data : data.objects || [];
+    const objects = Array.isArray(data) ? data : [...(data.objects || []), ...(data.environment?.entities || [])];
+    const parents = new Map((data.environment?.relations || [])
+      .filter(relation => relation.relation === 'observed_surface_part_of')
+      .map(relation => [relation.subject, relation.object]));
 
     const colorByLabel = new Map();
     let colorIdx = 0;
@@ -50,8 +53,10 @@ export class AnnotationParser {
         }
         return new Annotation({
           id: o.id || null,
-          label: o.label,
-          parentId: o.parent_id || null,
+          label: o.display_name || o.label,
+          parentId: o.parent_id || parents.get(o.id) || null,
+          kind: o.kind || 'object',
+          status: o.status || 'unreviewed',
           color: colorByLabel.get(o.label),
           ...toViewerSpace(o),
         });
