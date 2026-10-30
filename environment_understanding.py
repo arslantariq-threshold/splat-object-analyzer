@@ -234,6 +234,7 @@ def associate(nodes, tolerance, transforms=None, root=None):
     before joining it so a generic observation cannot bridge distinct houses.
     """
     from refine_inventory import surface_overlap
+    from scipy.spatial import cKDTree
     depths = {}
     if transforms is not None and root is not None:
         for index in {n['frame'] for n in nodes}:
@@ -243,6 +244,7 @@ def associate(nodes, tolerance, transforms=None, root=None):
     conflicts = [set() for _ in ordered]
     edges = []
     bounds = [(n['points'].min(0), n['points'].max(0)) for n in ordered]
+    trees = {}
     for i, a in enumerate(ordered):
         for j in range(i + 1, len(ordered)):
             b = ordered[j]
@@ -262,7 +264,10 @@ def associate(nodes, tolerance, transforms=None, root=None):
                     conflicts[i].add(j)
                     conflicts[j].add(i)
                 continue
-            ab, ba = surface_overlap(a['points'], b['points'], distance)
+            for index in (i, j):
+                if index not in trees:
+                    trees[index] = cKDTree(ordered[index]['points'])
+            ab, ba = surface_overlap(a['points'], b['points'], distance, trees=(trees[i], trees[j]))
             if mask_overlap is not None:
                 # A small crop of a larger segmented surface is not a second
                 # instance. Comparable, disjoint detections remain cannot-links.
@@ -488,6 +493,7 @@ def ground_environment(report, root, transforms, device, detector=None, detectio
 def attach_environment(result, environment, root):
     """Attach conservative part-of/located-in links supported by saved surfaces."""
     from refine_inventory import surface_overlap
+    from scipy.spatial import cKDTree
     entities = environment['entities']
     if environment['source_sha256'] != result['input']['sha256']:
         raise ValueError('Environment source fingerprint mismatch')
@@ -498,6 +504,12 @@ def attach_environment(result, environment, root):
         objects = {k: data[k] for k in data.files}
     with np.load(root / 'environment_surfaces.npz', allow_pickle=False) as data:
         surfaces = {k: data[k] for k in data.files}
+    bounds = {key: (points.min(0), points.max(0)) for key, points in surfaces.items()}
+    trees = {}
+    def surface_tree(key):
+        if key not in trees:
+            trees[key] = cKDTree(surfaces[key])
+        return trees[key]
     tolerance = max(float(result.get('instance_resolution', {}).get('voxel_size', .01)) * 2, 1e-5)
     relations = []
     structural_parts = {'window', 'door', 'roof', 'wall', 'exterior wall', 'house exterior',
@@ -508,11 +520,13 @@ def attach_environment(result, environment, root):
         points = objects.get(obj['id'], np.empty((0, 3)))
         if not len(points):
             continue
+        object_tree = cKDTree(points)
         options = []
         for entity in entities:
             if entity['kind'] != 'structure':
                 continue
-            ab, _ = surface_overlap(points, surfaces[entity['id']], tolerance)
+            ab, _ = surface_overlap(points, surfaces[entity['id']], tolerance,
+                trees=(object_tree, surface_tree(entity['id'])))
             if ab >= .7:
                 options.append((ab, entity))
         if options:
@@ -520,12 +534,15 @@ def attach_environment(result, environment, root):
             relations.append(dict(subject=obj['id'], relation='observed_surface_part_of', object=parent['id'], basis='segmented_surface_overlap'))
             parent['children'].append(obj['id'])
     # Adjacent is symmetric and geometric; no unsupported semantic "front".
-    from scipy.spatial import cKDTree
     for i, a in enumerate(entities):
         for b in entities[i+1:]:
             if a['kind'] == b['kind']:
                 continue
-            gap = float(cKDTree(surfaces[a['id']]).query(surfaces[b['id']])[0].min())
+            low_a, high_a = bounds[a['id']]
+            low_b, high_b = bounds[b['id']]
+            if np.any(high_a + tolerance * 3 < low_b) or np.any(high_b + tolerance * 3 < low_a):
+                continue
+            gap = float(surface_tree(a['id']).query(surfaces[b['id']])[0].min())
             if gap <= tolerance * 3:
                 relations.append(dict(subject=a['id'], relation='adjacent_to', object=b['id'],
                     basis='observed_surface_distance', gap_source_units=round(gap, 5)))

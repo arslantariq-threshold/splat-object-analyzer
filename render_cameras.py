@@ -371,10 +371,10 @@ def _select_preview_positions(candidates, surfaces, scores, n_positions, min_sep
     return selected
 
 
-def _preview_camera_positions(means, renderer, g, cfg, diagnostics_path=None):
+def _preview_camera_positions(means, renderer, g, cfg, diagnostics_path=None, camera_input=None):
     supplied = None
     if cfg.camera_input:
-        candidates, targets, supplied = _provided_camera_positions(means, cfg)
+        candidates, targets, supplied = _provided_camera_positions(means, cfg, camera_input)
     else:
         candidates, targets = _generate_camera_positions(means, max(cfg.camera_candidates, cfg.n_positions), cfg)
     _, _, diag, clearance, _ = _camera_geometry(means, cfg)
@@ -445,7 +445,7 @@ def _preview_camera_positions(means, renderer, g, cfg, diagnostics_path=None):
     return candidates[chosen], targets[chosen], report, clearance, diag
 
 
-def _provided_camera_positions(means, cfg):
+def _provided_camera_positions(means, cfg, camera_input=None):
     """Bound preview work and merge nearby capture centres before GPU inference.
 
     Front/back lenses and adjacent video frames are often almost co-located.
@@ -454,7 +454,7 @@ def _provided_camera_positions(means, cfg):
     """
     if cfg.camera_limit is not None and not 1 <= cfg.camera_limit <= 64:
         raise ValueError('camera_limit must be between 1 and 64')
-    model = load_camera_input(cfg.camera_input)
+    model = camera_input if camera_input is not None else load_camera_input(cfg.camera_input)
     _, _, diag, clearance, tree = _camera_geometry(means, cfg)
     positions = np.asarray([p['position'] for p in model['poses']], dtype=np.float64)
     distances, _ = tree.query(positions)
@@ -563,7 +563,8 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None,
     width, height = cfg.width, cfg.height
     n_positions, n_azimuth, n_elevation = cfg.n_positions, cfg.n_azimuth, cfg.n_elevation
     job_dir = Path(job_dir)
-    camera_hash = camera_fingerprint(load_camera_input(cfg.camera_input)) if cfg.camera_input else None
+    camera_input = load_camera_input(cfg.camera_input) if cfg.camera_input else None
+    camera_hash = camera_fingerprint(camera_input) if camera_input is not None else None
     capture_settings = {key: getattr(cfg, key) for key in ('quality', 'camera_limit', 'camera_candidates', 'min_sep_frac',
         'fov_x_degrees', 'width', 'height', 'n_positions', 'n_azimuth', 'n_elevation')} if cfg.camera_input else None
     if (job_dir/'transforms.json').exists():
@@ -617,7 +618,7 @@ def render_views(ply_path: str, job_dir: str, cfg: PipelineConfig | None = None,
 
     visible_means = means_np[np.isfinite(arrays['opacities']) & (arrays['opacities'] > -2.2)]
     cam_positions, look_targets, placement, clearance, diag = _preview_camera_positions(
-        visible_means, renderer, g, cfg, job_dir / 'camera_diagnostics.json')
+        visible_means, renderer, g, cfg, job_dir / 'camera_diagnostics.json', camera_input)
     poses, position_indices = _build_poses(cam_positions, n_azimuth, n_elevation)
     total = len(poses)
     print(f"[render] {len(cam_positions)} positions × {n_azimuth} azimuth × {n_elevation} elevation = {total} views"

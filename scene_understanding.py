@@ -289,7 +289,12 @@ def build_understanding(scene, model_factory=LocalVLM):
                 refresh_bindings(existing)
                 atomic_json(target, existing)
             return existing
-    model = model_factory()
+    model = None
+    def ask(*args, **kwargs):
+        nonlocal model
+        if model is None:
+            model = model_factory()
+        return model.ask(*args, **kwargs)
     overview = scene.overview_frames()
     emit('Understanding the room and its main subjects')
     cache = scene.assets / 'overview.json'
@@ -299,7 +304,7 @@ def build_understanding(scene, model_factory=LocalVLM):
     elif cache.exists() and (cached := json.loads(cache.read_text())).get('fingerprint') == digest:
         room = cached['value']
     else:
-        room = model.ask('These are different views of the same scene. Describe what kind of space it is and its main visible areas. '
+        room = ask('These are different views of the same scene. Describe what kind of space it is and its main visible areas. '
                          'JSON: {"scene_type":"...","description":"two sentences","confidence":"high|medium|low"}.',
                          [scene.image(i) for i in overview], tokens=250, schema=room_schema())
         atomic_json(cache, dict(fingerprint=digest, value=room))
@@ -319,7 +324,7 @@ def build_understanding(scene, model_factory=LocalVLM):
                 mosaic.paste(card, ((index%2)*512, (index//2)*288))
             mosaic.save(scene.assets / f'evidence-{offset:04d}.jpg', quality=90)
             try:
-                answer = model.ask('Each labeled card shows up to TWO views of ONE proposed object; background is dimmed. '
+                answer = ask('Each labeled card shows up to TWO views of ONE proposed object; background is dimmed. '
                          'Check the proposed category against the highlighted object. Describe each supplied ID once. '
                          'Do not merge IDs or describe neighboring objects as part of the target. '
                          'Use uncertain for unclear crops, rejected for clearly incorrect detections. '
@@ -334,7 +339,7 @@ def build_understanding(scene, model_factory=LocalVLM):
                 for obj, card in zip(batch, cards):
                     emit('Retrying an individual object description', offset+len(recovered), len(objects))
                     try:
-                        item = model.ask('Describe the highlighted object in these two views. The proposed label may be wrong. '
+                        item = ask('Describe the highlighted object in these two views. The proposed label may be wrong. '
                             'Return JSON with category, display_name (at most eight words), and status (supported, uncertain, or rejected). '
                             'Proposed label: '+obj['label'], [card], tokens=200)
                         if not item.get('display_name'):
@@ -382,7 +387,7 @@ def build_understanding(scene, model_factory=LocalVLM):
     elif not concepts:
         answer = dict(room, groups=[], tour_categories=[])
     else:
-        answer = model.ask('These categories and example descriptions come from one scanned scene. '
+        answer = ask('These categories and example descriptions come from one scanned scene. '
             'Describe the overall indoor or outdoor environment in ONE factual sentence, accounting for structures, spatial areas and objects. '
             'Propose up to 4 useful groups for filming. Define each group by an anchor CATEGORY and up to 4 nearby member CATEGORIES. '
             'For example a desk setup can be anchored on a desk and include a monitor, chair and lamp; a sleeping area can use a bed. '

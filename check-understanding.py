@@ -58,6 +58,11 @@ with tempfile.TemporaryDirectory() as temporary:
     assert index['groups'][0]['object_ids']==['object_0001']
     calls=model.calls
     assert build_understanding(scene,lambda: (_ for _ in ()).throw(AssertionError('cache missed'))) == index
+    # Interrupted publication must reuse completed batch caches without loading
+    # the model again just to rebuild the final index.
+    (root/'scene-understanding.json').unlink()
+    assert build_understanding(scene,lambda: (_ for _ in ()).throw(AssertionError('Cached descriptions loaded the model'))) == index
+    assert model.calls == calls
     selection=select_subjects(index,'Show my desk setup',lambda idx,prompt:model.ask(prompt))
     assert selection['object_ids']==['object_0001']
     missing=select_subjects(index,'Show a spaceship',lambda idx,prompt:model.ask(prompt))

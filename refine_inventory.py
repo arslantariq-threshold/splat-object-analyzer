@@ -95,14 +95,15 @@ def fit_oriented_box(points, minimum_size):
             'rotation': dict(zip('xyzw', map(float, quaternion)))}
 
 
-def surface_overlap(a, b, tolerance):
+def surface_overlap(a, b, tolerance, trees=None):
     """Directional visible-surface coverage, independent of detector box centres."""
     if not len(a) or not len(b):
         return 0., 0.
     if np.any(a.max(0) + tolerance < b.min(0)) or np.any(b.max(0) + tolerance < a.min(0)):
         return 0., 0.
-    da = cKDTree(b).query(a, distance_upper_bound=tolerance)[0]
-    db = cKDTree(a).query(b, distance_upper_bound=tolerance)[0]
+    tree_a, tree_b = trees if trees is not None else (cKDTree(a), cKDTree(b))
+    da = tree_b.query(a, distance_upper_bound=tolerance)[0]
+    db = tree_a.query(b, distance_upper_bound=tolerance)[0]
     return float(np.isfinite(da).mean()), float(np.isfinite(db).mean())
 
 

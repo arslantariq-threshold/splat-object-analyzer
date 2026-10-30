@@ -114,6 +114,19 @@ with tempfile.TemporaryDirectory() as temporary:
     else: raise AssertionError('Unusable capture locations silently accepted')
     print('PASS capture render path writes matched RGB/depth/matrices and rejects mismatched locations')
 
+    auto = PipelineConfig(camera_candidates=12, n_positions=2, preview_size=32, navigation=False,
+        width=64, height=64, n_azimuth=4, n_elevation=1)
+    with patch.object(render, 'get_renderer', return_value=PreviewRenderer()), \
+         patch.object(render, '_load_ply_arrays', return_value=arrays), \
+         patch.object(render, 'load_camera_input', side_effect=AssertionError('Splat-only rendering parsed camera files')), \
+         patch.object(render, '_provided_camera_positions', side_effect=AssertionError('Splat-only rendering required capture poses')):
+        output = render.render_views(str(source), str(root/'automatic'), auto)
+    automatic = json.loads(Path(output).read_text())
+    assert automatic['camera_placement'] == 'preview_validated_surface_coverage'
+    assert 'camera_input' not in automatic['camera_validation']
+    assert len(automatic['camera_positions']) == 2 and len(automatic['frames']) == 8
+    print('PASS splat-only rendering uses automatic placement without reading or requiring camera inputs')
+
 if len(sys.argv) > 1:
     real = load_camera_input(sys.argv[1])
     assert len(real['poses']) == 600
